@@ -1,0 +1,185 @@
+#version 460 core
+
+layout(local_size_x = 2, local_size_y = 1, local_size_z = 1) in;
+
+layout(rgba8, binding = 0) uniform image2D destTex;
+
+uniform float time;
+uniform float framesStill;
+uniform ivec2 resolution;
+
+const int MAX_REFLECTIONS = 6;
+const int NUMBER_OF_SMAPLES = 3;
+const float MAX_DIST = 1000.0;
+
+// random seed
+uint rSeed;
+
+struct Sdf {
+    float d;
+    float d2;
+    vec3 n;
+    vec3 n2;
+};
+
+struct Ray {
+    Sdf sdf;
+    vec3 col;
+    vec3 pos;
+};
+
+void pcg_hash() {
+    uint state = rSeed * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    rSeed = (word >> 22u) ^ word;
+}
+
+float hashFloat() {
+    pcg_hash();
+    return float(rSeed) / float(0xFFFFFFFFu);
+}
+
+vec3 randomOnSphere() {
+	vec3 rand = vec3(hashFloat(), hashFloat(), hashFloat());
+	float theta = rand.x * 2.0 * 3.14159265;
+	float v = rand.y;
+	float phi = acos(2.0 * v - 1.0);
+	float r = pow(rand.z, 1.0 / 3.0);
+	float x = r * sin(phi) * cos(theta);
+	float y = r * sin(phi) * sin(theta);
+	float z = r * cos(phi);
+	return vec3(x, y, z);
+}
+
+vec3 applySkyBox(vec3 rd) {
+    return vec3(0.5, 0.6, 1.0);
+}
+
+Sdf sdSphere( in vec3 ro, in vec3 rd, in vec3 ce, float ra ) {
+    vec3 oc = ro - ce;
+    float b = dot( oc, rd );
+    vec3 qc = oc - b*rd;
+    float h = ra*ra - dot( qc, qc );
+    // no intersection
+    if( h<0.0 ) return Sdf(MAX_DIST, MAX_DIST, vec3(0), vec3(0));
+    h = sqrt( h );
+    float d = -b - h;
+    float d2 = -b + h;
+    // normal of the nearest hit
+    vec3 n = normalize((ro + rd * (d - 0.001)) - ce);
+    // normal of the farest hit
+    vec3 n2 = normalize((ro + rd * (d2 - 0.001)) - ce);
+
+    return Sdf(d, d2, n, n2);
+}
+
+Sdf sdCube( in vec3 ro, in vec3 rd, in vec3 ce, vec3 boxSize, float IOR) {   
+    ro -= ce;
+    vec3 m = 1.0/rd;
+    vec3 n = m*ro;
+    vec3 k = abs(m)*boxSize;
+    vec3 t1 = -n - k;
+    vec3 t2 = -n + k;
+    float tN = max( max( t1.x, t1.y ), t1.z );
+    float tF = min( min( t2.x, t2.y ), t2.z );
+    // no intersection
+    if( tN>tF || tF<0.0) return Sdf(MAX_DIST, MAX_DIST, vec3(0), vec3(0));
+    // normal of the nearest hit
+    vec3 N = (tN>0.0) ? step(vec3(tN),t1) : step(t2,vec3(tF));
+    N *= -sign(rd);
+    // normal of the farest hit
+    // there is no need to calculate object's N2 if it is not a lense as it will not be used
+    vec3 N2 = vec3(0);
+    if (IOR != -1.0){
+        N2 = (tF > 0.0) ? step(t1, vec3(tN)) : step(vec3(tF), t2);
+        N2 *= sign(rd);
+    }
+
+    return Sdf(tN, tF, N, N2);
+}
+
+Sdf sdPlane(in vec3 ro, in vec3 rd, in vec4 p) {
+	float d = -(dot(ro, p.xyz) + p.w) / dot(rd, p.xyz);
+    return Sdf(d, d, p.xyz, vec3(0));
+}
+
+Ray Min(Ray minIt, Ray obj) {
+    return (obj.sdf.d > 0.0 && obj.sdf.d < minIt.sdf.d) ? obj : minIt;
+}
+
+Ray getClosestObject(vec3 ro, vec3 rd) {
+    Ray object;
+    object.sdf.d = MAX_DIST;
+
+    Ray plane;
+    plane.pos = vec3(0, -1.0, 0.0);
+    plane.sdf = sdPlane(ro, rd, vec4(0, 1, 0, -1.0 * plane.pos.y));
+    plane.col = vec3(0.6);
+
+    Ray sphere;
+    sphere.col = vec3(0.9);
+    sphere.pos = vec3(0.0);
+    sphere.sdf = sdSphere(ro, rd, sphere.pos, 1.0);
+
+    object = Min(object, plane);
+    object = Min(object, sphere);
+
+    return object;
+}
+
+Ray castRay(inout vec3 ro, inout vec3 rd) {
+    Ray objectHit = getClosestObject(ro, rd);
+    // if hit the sky
+    if (objectHit.sdf.d == MAX_DIST) {
+        objectHit.col = applySkyBox(rd);
+        return objectHit;
+    }
+
+    // move the ray origin close to the intersection
+    ro += rd * (objectHit.sdf.d - 0.001);
+
+    vec3 rOnSphere = randomOnSphere();
+    rd = normalize(rOnSphere * dot(rOnSphere, objectHit.sdf.n));
+
+    return objectHit;
+}
+
+vec3 rayTrace(vec2 uv) {
+    vec3 col = vec3(1.0);
+    // ray
+    vec3 rd = normalize(vec3(uv.x, uv.y, 1.0));
+    vec3 ro = vec3(0.0, 1.0, -5.0);
+
+    for ( int i=0; i<MAX_REFLECTIONS; ++i ) {
+        Ray refRay = castRay(ro, rd);
+        col *= refRay.col;
+
+        if (refRay.sdf.d == MAX_DIST) return col;
+    }
+
+    return col;
+}
+
+
+vec3 getCol(vec2 uv)
+{
+    vec3 col = vec3(0.0);
+
+    col = rayTrace(uv);
+
+    return col;
+}
+
+void main()
+{   
+    // calculate the pixel cordinate in range -1.0 <-> 1.0
+    ivec2 pixel_cords = ivec2(gl_GlobalInvocationID.xy);
+    vec2 uv = (vec2(pixel_cords.xy) - 0.5 * resolution) / resolution.y;
+
+    // initialise random seed
+    rSeed = uint(pixel_cords.x * pixel_cords.y) * uint(time*256);
+
+    vec3 col = getCol(uv);
+
+    imageStore(destTex, pixel_cords, vec4(col, 1.0));
+}
