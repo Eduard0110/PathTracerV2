@@ -62,6 +62,12 @@ GLint BaseShaderProgram::getUniformLocation(const std::string& name) const {
     return location;
 }
 
+#include <array>
+
+void BaseShaderProgram::setUniform(const std::string& name, bool value) const {
+    glUniform1i(getUniformLocation(name), value);
+}
+
 void BaseShaderProgram::setUniform(const std::string& name, int value) const {
     glUniform1i(getUniformLocation(name), value);
 }
@@ -76,4 +82,20 @@ void BaseShaderProgram::setUniform(const std::string& name, int value1, int valu
 
 void BaseShaderProgram::setUniform(const std::string& name, float value1, float value2) const {
     glUniform2f(getUniformLocation(name), value1, value2);
+}
+
+void BaseShaderProgram::setUniform(const std::string& name, int value1, int value2, int value3) const {
+    glUniform3i(getUniformLocation(name), value1, value2, value3);
+}
+
+void BaseShaderProgram::setUniform(const std::string& name, float value1, float value2, float value3) const {
+    glUniform3f(getUniformLocation(name), value1, value2, value3);
+}
+
+void BaseShaderProgram::setUniform(const std::string& name, const std::array<int, 3>& values) const {
+    glUniform3i(getUniformLocation(name), values[0], values[1], values[2]);
+}
+
+void BaseShaderProgram::setUniform(const std::string& name, const std::array<float, 3>& values) const {
+    glUniform3f(getUniformLocation(name), values[0], values[1], values[2]);
 }

@@ -1,9 +1,9 @@
 #include "App.hpp"
 #include <math.h>
 
-static constexpr const char* COMPUTE_SHADER_PATH  = "C:/Users/golon/source/repos/PathTracer/shaders/ComputeShader.comp";
-static constexpr const char* VERTEX_SHADER_PATH   = "C:/Users/golon/source/repos/PathTracer/shaders/VertexShader.vs";
-static constexpr const char* FRAGMENT_SHADER_PATH = "C:/Users/golon/source/repos/PathTracer/shaders/FragmentShader.fs";
+static constexpr const char* COMPUTE_SHADER_PATH  = "C:/Users/artho/Desktop/PathTracer/shaders/ComputeShader.comp";
+static constexpr const char* VERTEX_SHADER_PATH   = "C:/Users/artho/Desktop/PathTracer/shaders/VertexShader.vert";
+static constexpr const char* FRAGMENT_SHADER_PATH = "C:/Users/artho/Desktop/PathTracer/shaders/FragmentShader.frag";
 
 // construcotr / destructor
 
@@ -57,7 +57,7 @@ App::~App() {
 void App::initGLFW() {
     glfwSetErrorCallback(glfwErrorCallback);
     if (!glfwInit()) {
-        std::cerr << "Failed to initialize GLFW.\n";
+        std::cerr << "Failed to initialize GLFW./n";
         std::exit(EXIT_FAILURE);
     }
 
@@ -69,7 +69,7 @@ void App::initGLFW() {
 void App::createWindow() {
     m_window = glfwCreateWindow(m_WINDOW_WIDTH, m_WINDOW_HEIGHT, "PathTracer", nullptr, nullptr);
     if (!m_window) {
-        std::cerr << "Failed to create GLFW window.\n";
+        std::cerr << "Failed to create GLFW window./n";
         glfwTerminate();
         std::exit(EXIT_FAILURE);
     }
@@ -79,7 +79,7 @@ void App::createWindow() {
 
 void App::initGLAD() {
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
-        std::cerr << "Failed to initialize GLAD.\n";
+        std::cerr << "Failed to initialize GLAD./n";
         glfwDestroyWindow(m_window);
         glfwTerminate();
         std::exit(EXIT_FAILURE);
@@ -94,7 +94,7 @@ void App::glfwErrorCallback(int error, const char* message) {
 // debug info
 void App::printDebugInfo() {
     std::cout << "GL Version: " << glGetString(GL_VERSION) << std::endl;
-    std::cout << "GLSL Version: " << glGetString(GL_SHADING_LANGUAGE_VERSION) << "\n\n";
+    std::cout << "GLSL Version: " << glGetString(GL_SHADING_LANGUAGE_VERSION) << "/n/n";
 
     int work_grp_cnt[3], work_grp_size[3], invocations;
     glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_COUNT, 0, &work_grp_cnt[0]);
@@ -104,7 +104,7 @@ void App::printDebugInfo() {
     std::cout << "Max work group count: "
         << "x: " << work_grp_cnt[0] << ", "
         << "y: " << work_grp_cnt[1] << ", "
-        << "z: " << work_grp_cnt[2] << '\n';
+        << "z: " << work_grp_cnt[2] << '/n';
 
     glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_SIZE, 0, &work_grp_size[0]);
     glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_SIZE, 1, &work_grp_size[1]);
@@ -113,10 +113,10 @@ void App::printDebugInfo() {
     std::cout << "Max work group size: "
         << "x: " << work_grp_size[0] << ", "
         << "y: " << work_grp_size[1] << ", "
-        << "z: " << work_grp_size[2] << '\n';
+        << "z: " << work_grp_size[2] << '/n';
 
     glGetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &invocations);
-    std::cout << "Max work group invocations: " << invocations << "\n\n";
+    std::cout << "Max work group invocations: " << invocations << "/n/n";
 }
 
 // export image in png
@@ -150,24 +150,26 @@ void App::setStaticUniforms() {
 void App::setPerFrameUniforms() {
     m_uniforms.time = static_cast<float>(glfwGetTime());
     m_compute_program.setUniform("time", m_uniforms.time);
+    m_compute_program.setUniform("camera_position", m_camera.getPosition());
+    m_compute_program.setUniform("camera_rotation", m_camera.getRotation());
 }
 
 // clock
 void App::updateDeltaTime() {
     double currentTime = glfwGetTime();
-    deltaTime = currentTime - lastTime;
-    lastTime = currentTime;
+    m_delta_time = currentTime - m_last_time;
+    m_last_time = currentTime;
 }
 
 void App::updateWindowCaption() const {
     if (static_cast<int>(m_uniforms.frame_count) % 60 == 1) {
-        double fps = 1.0 / deltaTime;;
+        double fps = 1.0 / m_delta_time;;
 
         std::ostringstream title;
         title << "PathTracer - "
             << std::fixed << std::setprecision(1)
             << fps << " FPS | "
-            << deltaTime << " ms/frame";
+            << m_delta_time << " ms/frame";
 
         glfwSetWindowTitle(m_window, title.str().c_str());
     }
@@ -175,10 +177,71 @@ void App::updateWindowCaption() const {
 
 // main loop functions
 
+bool arraysDiffer(const std::array<float, 3>& a, const std::array<float, 3>& b, float epsilon = 0.0001f) {
+    for (int i = 0; i < 3; ++i) {
+        if (std::abs(a[i] - b[i]) > epsilon) return true;
+    }
+    return false;
+}
+
+void App::checkCameraChange() {
+    const auto& current_position = m_camera.getPosition();
+    const auto& current_rotation = m_camera.getRotation();
+
+    if (arraysDiffer(current_position, m_last_camera_pos) ||
+        arraysDiffer(current_rotation, m_last_camera_rot)) {
+        m_uniforms.frame_count = 1;
+    }
+    else {
+        m_uniforms.frame_count++;
+    }
+
+    // Update last state
+    m_last_camera_pos = current_position;
+    m_last_camera_rot = current_rotation;
+}
+
 void App::processInput() {
     glfwPollEvents();
+
+    // update rotation
+    double mouseX, mouseY;
+    glfwGetCursorPos(m_window, &mouseX, &mouseY);
+
+    int windowWidth, windowHeight;
+    glfwGetWindowSize(m_window, &windowWidth, &windowHeight);
+
+    m_camera.rotate(
+        static_cast<float>(mouseX),
+        static_cast<float>(mouseY),
+        static_cast<float>(windowWidth),
+        static_cast<float>(windowHeight)
+    );
+
+    // update position
+    float x(0.0f), y(0.0f), z(0.0f);
+    if (glfwGetKey(m_window, GLFW_KEY_W) == GLFW_PRESS) z = 1.0f;  // Forward
+    if (glfwGetKey(m_window, GLFW_KEY_S) == GLFW_PRESS) z = -1.0f; // Backward
+    if (glfwGetKey(m_window, GLFW_KEY_A) == GLFW_PRESS) x = -1.0f; // Left
+    if (glfwGetKey(m_window, GLFW_KEY_D) == GLFW_PRESS) x = 1.0f;  // Right
+    if (glfwGetKey(m_window, GLFW_KEY_SPACE) == GLFW_PRESS) y = 1.0f;  // Up
+    if (glfwGetKey(m_window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) y = -1.0f; // Down
+    m_camera.move(x, y, z, m_delta_time);
+
+    // track toggle key
+    const int toggleKey = GLFW_KEY_E;
+    bool isPressed = glfwGetKey(m_window, toggleKey) == GLFW_PRESS;
+
+    // if key was not pressed before but is now, toggle the state
+    if (isPressed && !m_keyStates[toggleKey]) {
+        m_camera.switchUpdate();
+    }
+
+    // Store current key state for next frame
+    m_keyStates[toggleKey] = isPressed;
+
     m_my_gui.newFrameImGui();
-    m_uniforms.frame_count++;
+    checkCameraChange();
 }
 
 void App::updateFrame() {
@@ -195,8 +258,8 @@ void App::runComputeShaderPass() {
     // bind texture as render target
     m_compute_texture.bindImageTexture();
 
-    GLuint groups_x = static_cast<GLuint>(std::ceil(m_WINDOW_WIDTH / 2.0f));
-    GLuint groups_y = static_cast<GLuint>(std::ceil(m_WINDOW_HEIGHT / 1.0f));
+    GLuint groups_x = static_cast<GLuint>(std::ceil(m_WINDOW_WIDTH / 8.0f));
+    GLuint groups_y = static_cast<GLuint>(std::ceil(m_WINDOW_HEIGHT / 4.0f));
     glDispatchCompute(groups_x, groups_y, 1);
 
     glMemoryBarrier(GL_ALL_BARRIER_BITS);

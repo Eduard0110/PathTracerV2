@@ -27,6 +27,7 @@ set(SOURCE_FILES
     MyGui.cpp
     Framebuffer.cpp
     BaseShaderProgram.cpp
+    Camera.cpp
 
     ${CMAKE_SOURCE_DIR}/include/stb/stb_image_write.cpp
     ${CMAKE_SOURCE_DIR}/include/glad/glad.c
