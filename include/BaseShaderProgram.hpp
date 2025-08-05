@@ -18,11 +18,15 @@ public:
     BaseShaderProgram(BaseShaderProgram&&) noexcept;
     BaseShaderProgram& operator=(BaseShaderProgram&&) noexcept;
 
-    void setUniform(const std::string& name, int value) const;
-    void setUniform(const std::string& name, float value) const;
-    void setUniform(const std::string& name, GLuint value) const;
-    void setUniform(const std::string& name, int value1, int value2) const;
-    void setUniform(const std::string& name, float value1, float value2) const;
+    void setUniform(const std::string& name, bool value) const;                                // 1 bool
+    void setUniform(const std::string& name, int value) const;                                // 1 int
+    void setUniform(const std::string& name, float value) const;                              // 1 float
+    void setUniform(const std::string& name, int value1, int value2) const;                   // 2 ints
+    void setUniform(const std::string& name, float value1, float value2) const;               // 2 float
+    void setUniform(const std::string& name, int value1, int value2, int value3) const;       // 3 ints
+    void setUniform(const std::string& name, float value1, float value2, float value3) const; // 3 floats
+    void setUniform(const std::string& name, const std::array<int, 3>& values) const;         // 3 ints
+    void setUniform(const std::string& name, const std::array<float, 3>& values) const;       // 3 floats
 
 
     void use() const { glUseProgram(m_id); }

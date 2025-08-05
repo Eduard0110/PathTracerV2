@@ -22,6 +22,8 @@
 #include "stb/stb_image.h"
 #include <stb/stb_image_write.h>
 
+#include "Camera.hpp"
+
 class App {
 public:
 	App();
@@ -46,6 +48,7 @@ private:
 	void updateWindowCaption() const;
 
 	// main loop functions
+	void checkCameraChange();
 	void processInput();
 	void updateFrame();
 	void runComputeShaderPass();
@@ -53,12 +56,12 @@ private:
 	void renderGui();
 
 private:
-	static constexpr int m_WINDOW_WIDTH = 1600;
-	static constexpr int m_WINDOW_HEIGHT = 900;
+	static constexpr int m_WINDOW_WIDTH = 2560;
+	static constexpr int m_WINDOW_HEIGHT = 1440;
 
 	struct FrameUniforms {
 		float time = 0.0f;
-		float frame_count = 0.0f;
+		float frame_count = 1.0f;
 	};
 
 	GLFWwindow* m_window = nullptr;
@@ -74,8 +77,8 @@ private:
 	bool m_ping = true;
 
 	// clock
-	double lastTime = 0.0;
-	double deltaTime = 0.0;
+	double m_last_time = 0.0;
+	double m_delta_time = 0.0;
 
 	// GL objects
 	ComputeProgram m_compute_program;
@@ -92,4 +95,14 @@ private:
 	Framebuffer m_ping1_fbo;
 	Framebuffer m_ping2_fbo;
 	Framebuffer m_post_proccess_fbo;
+	
+	// Camera
+	Camera m_camera;
+	std::array<float, 3> m_last_camera_pos = { 0.0f, 0.0f, 0.0f };
+	std::array<float, 3> m_last_camera_rot = { 0.0f, 0.0f, 0.0f };
+
+	// key states to track toggle events
+	std::unordered_map<int, bool> m_keyStates;
+	bool m_accumulate = false;
+
 };
