@@ -2,6 +2,9 @@
 
 A GPU path tracer written in C++17 using OpenGL compute shaders
 
+> [!NOTE]
+> This project is still in active development.
+
 <img width="1600" height="900" alt="RandomTest361" src="https://github.com/user-attachments/assets/fc8ac859-8f64-41e2-828d-aff3e94e1280" />
 
 ## Features
