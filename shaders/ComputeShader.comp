@@ -1,0 +1,665 @@
+#version 460 core
+
+// triangle mesh data
+struct Triangle {
+    vec4 v0, v1, v2;
+    vec4 n0, n1, n2;
+    vec4 uv0, uv1, uv2;
+    uint materialId, meshId, objectId, padding;
+};
+
+// materials
+struct Material {
+    vec4 baseColour;
+    vec4 emission;    // 4th component is emission strength
+    vec4 absorption;  // 4th component is isTransparent bool
+
+    float roughness;
+    float metallic;
+    float ior;   
+    bool isTransparent;
+
+};
+
+// GPU BVH node structure
+struct BVHNode {
+    vec4 min;
+    vec4 max;
+
+    int left;
+    int right;
+
+    int start;
+    int count;
+};
+
+// Ray Structures
+struct Sdf {
+    float d;
+    vec3 n;
+};
+
+struct Hit {
+    Sdf sdf;
+    uint materialId;
+    uint objectId;
+};
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba16f, binding = 0) uniform image2D destTex;
+
+layout(std430, binding = 1) readonly buffer TriangleBuffer {
+    Triangle triangles[];
+};
+
+layout(std430, binding = 2) readonly buffer BVHBuffer {
+    BVHNode nodes[];
+};
+
+layout(std430, binding = 3) readonly buffer TriangleIndexBuffer {
+    int triangleIndices[];
+};
+
+layout(std430, binding = 4) readonly buffer MaterialBuffer {
+    Material materials[];
+};
+
+layout(binding = 5) uniform sampler2D SkyboxTexture;
+
+// uniforms
+uniform int totalFrameCount;
+uniform ivec2 resolution;
+
+uniform vec3 cameraPos;
+uniform vec3 cameraRot;
+uniform float cameraFocalLength;
+uniform float cameraApertureRadius;
+uniform float cameraFocusDistance;
+
+uniform bool clampSkybox;
+uniform float skyboxClampValue;
+
+uniform bool russianRoulette;
+uniform int maxReflections;
+uniform int samplesPerPixel;
+
+// constants
+const int MAX_BVH_STACK = 64;
+const float MAX_DIST = 1000.0;
+const float CAMERA_SENSOR_WIDTH_MM = 36.0;
+const float PI = 3.14159265;
+const float airIor = 1.0f;
+const vec3 airAbsorptionColour = vec3(0.0f);
+
+// random seed
+uint rSeed;
+
+mat2x2 rot2d(float a) {
+    float s = sin(a);
+    float c = cos(a);
+    return mat2x2(c, -s, s, c);
+}
+
+void pcg_hash() {
+    uint state = rSeed * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    rSeed = (word >> 22u) ^ word;
+}
+
+float hashFloat() {
+    pcg_hash();
+    return float(rSeed) / float(0xFFFFFFFFu);
+}
+
+vec2 randomInDisk() {
+    float angle = 2.0 * PI * hashFloat();
+    float radius = sqrt(hashFloat());  // uniformly distributed 
+
+    return vec2(cos(angle), sin(angle)) * radius;
+}
+
+vec3 cosineWeightedHemisphere(vec3 normal) {
+    float r1 = hashFloat();
+    float r2 = hashFloat();
+
+    float phi = 2.0 * 3.14159265 * r1;
+    float r = sqrt(r2);
+
+    // A direction in local space, where +Z is the surface normal.
+    vec3 localDirection = vec3(
+        r * cos(phi),
+        r * sin(phi),
+        sqrt(1.0 - r2)
+    );
+
+    // Build two perpendicular axes around the normal.
+    vec3 helper = abs(normal.z) < 0.999
+        ? vec3(0.0, 0.0, 1.0)
+        : vec3(1.0, 0.0, 0.0);
+
+    vec3 tangent = normalize(cross(helper, normal));
+    vec3 bitangent = cross(normal, tangent);
+
+    // Convert the local direction into world space.
+    return normalize(
+        tangent * localDirection.x +
+        bitangent * localDirection.y +
+        normal * localDirection.z
+    );
+}
+
+// https://en.wikipedia.org/wiki/SRGB
+// a colour's percived brightness on a scale 0-1
+// green contributes the most to the brightness
+float luminance(vec3 colour) {
+    return dot(colour, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// https://en.wikipedia.org/wiki/Schlick%27s_approximation
+// objects are more reflective at grazing angles
+vec3 fresnelSchlick(float cosTheta, vec3 f0) {
+    float factor = pow(1.0 - clamp(cosTheta, 0.0, 1.0), 5.0);
+    return f0 + (vec3(1.0) - f0) * factor;
+}
+
+float fresnelSchlick(float cosTheta, float f0) {
+    float factor = pow(1.0 - clamp(cosTheta, 0.0, 1.0), 5.0);
+    return f0 + (1.0 - f0) * factor;
+}
+
+float smithG1(float nDotDirection, float alpha) {
+    float alphaSquared = alpha * alpha;
+    float nDotDirectionSquared = nDotDirection * nDotDirection;
+    return 2.0 * nDotDirection / (nDotDirection + sqrt(alphaSquared + (1.0 - alphaSquared) * nDotDirectionSquared));
+}
+
+vec3 sampleGGXHalfVector(vec3 normal, float roughness) {
+    // squaring perceptual roughness gives a more useful artist-facing control
+    float alpha = max(roughness * roughness, 0.001);
+    float alphaSquared = alpha * alpha;
+
+    float r1 = hashFloat();
+    float r2 = hashFloat();
+    float phi = 2.0 * 3.14159265 * r1;
+    float cosTheta = sqrt((1.0 - r2) / (1.0 + (alphaSquared - 1.0) * r2));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+
+    vec3 localHalfVector = vec3(
+        sinTheta * cos(phi),
+        sinTheta * sin(phi),
+        cosTheta
+    ); 
+    
+    vec3 helper = abs(normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+
+    vec3 tangent = normalize(cross(helper, normal));
+    vec3 bitangent = cross(normal, tangent);
+
+    return normalize(
+        tangent * localHalfVector.x +
+        bitangent * localHalfVector.y +
+        normal * localHalfVector.z
+    );
+}
+
+vec2 directionToUV(vec3 direction) {
+    direction = normalize(direction);
+
+    float u = atan(direction.z, direction.x) / (2.0 * PI) + 0.5;
+    float v = asin(clamp(direction.y, -1.0, 1.0)) / PI + 0.5;
+
+    return vec2(u, v);
+}
+
+vec3 applySkyBox(vec3 rd) {
+    vec2 uv = directionToUV(rd);
+    uv.y = 1.0 - uv.y;
+    vec3 skyboxRadiance = texture(SkyboxTexture, uv).rgb;
+
+    if (clampSkybox)
+        skyboxRadiance = min(skyboxRadiance, vec3(max(skyboxClampValue, 0.0)));
+
+    return skyboxRadiance;
+}
+
+bool rayAABB(vec3 ro, vec3 invDirection, vec3 boxMin, vec3 boxMax, float maxDistance, out float tNear) {
+    float tx1 = (boxMin.x - ro.x) * invDirection.x;
+    float tx2 = (boxMax.x - ro.x) * invDirection.x;
+
+    float tMin = min(tx1, tx2);
+    float tMax = max(tx1, tx2);
+
+    float ty1 = (boxMin.y - ro.y) * invDirection.y;
+    float ty2 = (boxMax.y - ro.y) * invDirection.y;
+
+    tMin = max(tMin, min(ty1, ty2));
+    tMax = min(tMax, max(ty1, ty2));
+
+    float tz1 = (boxMin.z - ro.z) * invDirection.z;
+    float tz2 = (boxMax.z - ro.z) * invDirection.z;
+
+    tMin = max(tMin, min(tz1, tz2));
+    tMax = min(tMax, max(tz1, tz2));
+
+    tNear = max(tMin, 0.0);
+    return tMax >= tNear && tNear < maxDistance;
+}
+
+Sdf sdSphere( in vec3 ro, in vec3 rd, in vec3 ce, float ra ) {
+    vec3 oc = ro - ce;
+    float b = dot( oc, rd );
+    vec3 qc = oc - b*rd;
+    float h = ra*ra - dot( qc, qc );
+    // no intersection
+    if( h<0.0 ) return Sdf(MAX_DIST, vec3(0));
+    h = sqrt( h );
+    float d = -b - h;
+    //float d2 = -b + h;
+    // normal of the nearest hit
+    vec3 n = normalize((ro + rd * (d - 0.001)) - ce);
+    // normal of the farest hit
+    //vec3 n2 = normalize((ro + rd * (d2 - 0.001)) - ce);
+
+    return Sdf(d, n);
+}
+
+Sdf triIntersect(vec3 ro, vec3 rd, vec3 v0, vec3 v1, vec3 v2, vec3 n0, vec3 n1, vec3 n2) {
+    vec3 v1v0 = v1 - v0;
+    vec3 v2v0 = v2 - v0;
+    vec3 rov0 = ro - v0;
+
+    vec3 faceNormal = cross(v1v0, v2v0);
+    vec3 q = cross(rov0, rd);
+
+    float denominator = dot(rd, faceNormal);
+
+    if (abs(denominator) < 1e-8)
+        return Sdf(-1.0, vec3(0.0));
+
+    float d = 1.0 / denominator;
+    float u = d * dot(-q, v2v0);
+    float v = d * dot(q, v1v0);
+    float t = d * dot(-faceNormal, rov0);
+
+    if (u < 0.0 || v < 0.0 || u + v > 1.0)
+        return Sdf(-1.0, vec3(0.0));
+
+    float w = 1.0 - u - v;
+    vec3 interpolatedNormal = w * n0 + u * n1 + v * n2;
+    vec3 normal = dot(interpolatedNormal, interpolatedNormal) > 1e-12
+        ? normalize(interpolatedNormal)
+        : normalize(faceNormal);
+
+    // ensure the normal faces against the incoming ray
+    if (dot(normal, rd) > 0.0)
+        normal = -normal;
+
+    return Sdf(t, normal);
+}
+
+Hit Min(Hit minIt, Hit obj) {
+    return (obj.sdf.d > 0.0 && obj.sdf.d < minIt.sdf.d) ? obj : minIt;
+}
+
+void drawTriangles(vec3 ro, vec3 rd, inout Hit object, int start, int count) {
+    for (int i = 0; i < count; ++i)
+            {
+                int triangleIndex = triangleIndices[start + i];
+                Triangle tri = triangles[triangleIndex];
+
+                Hit triangleHit;
+                triangleHit.sdf = triIntersect(
+                    ro, rd,
+                    tri.v0.xyz,
+                    tri.v1.xyz,
+                    tri.v2.xyz,
+                    tri.n0.xyz,
+                    tri.n1.xyz,
+                    tri.n2.xyz
+                );
+                triangleHit.materialId = tri.materialId;
+                triangleHit.objectId = tri.objectId;
+
+                object = Min(object, triangleHit);
+            }
+};
+
+Hit traverseBVH(vec3 ro, vec3 rd, Hit closestObject) {
+    // calculate 1 ray direction once, rather than once per BVH node
+    vec3 invDirection = 1.0 / rd;
+
+    int nodeStack[MAX_BVH_STACK];
+    float nearStack[MAX_BVH_STACK];
+    int stackSize = 0;
+
+    // test the root before adding it to the stack
+    float rootNear;
+    if (!rayAABB(ro, invDirection, nodes[0].min.xyz, nodes[0].max.xyz, closestObject.sdf.d, rootNear)) 
+        return closestObject;
+    
+
+    nodeStack[stackSize] = 0;
+    nearStack[stackSize] = rootNear;
+    stackSize++;
+
+    while (stackSize > 0) {
+        // pop the next node and its known box-entry distance
+        stackSize--;
+
+        int nodeIndex = nodeStack[stackSize];
+        float nodeNear = nearStack[stackSize];
+
+        // a closer triangle may have been found after this node was pushed
+        if (nodeNear >= closestObject.sdf.d)
+            continue;
+
+        BVHNode node = nodes[nodeIndex];
+
+        // leaf: test only the triangles assigned to this node
+        if (node.left < 0) {
+            drawTriangles(ro, rd, closestObject, node.start, node.count);
+            continue;
+        }
+
+        // test each child box now, before putting it on the stack
+        BVHNode leftNode = nodes[node.left];
+        BVHNode rightNode = nodes[node.right];
+
+        float leftNear;
+        float rightNear;
+
+        bool hitLeft  = rayAABB(ro, invDirection, leftNode.min.xyz,  leftNode.max.xyz,  closestObject.sdf.d, leftNear );
+        bool hitRight = rayAABB(ro, invDirection, rightNode.min.xyz, rightNode.max.xyz, closestObject.sdf.d, rightNear);
+
+        int requiredSlots = (hitLeft ? 1 : 0) + (hitRight ? 1 : 0);
+
+        if (stackSize + requiredSlots > MAX_BVH_STACK)
+            continue;
+
+        // these are deliberately ordered: farther child first
+        int firstNodeIndex = node.left;
+        float firstNear = leftNear;
+        bool hitFirst = hitLeft;
+
+        int secondNodeIndex = node.right;
+        float secondNear = rightNear;
+        bool hitSecond = hitRight;
+
+        // if left is nearer, swap them
+        // the farther child must be pushed first because the stack is LIFO
+        if (hitLeft && hitRight && leftNear < rightNear) {
+            firstNodeIndex = node.right;
+            firstNear = rightNear;
+
+            secondNodeIndex = node.left;
+            secondNear = leftNear;
+        }
+
+        if (hitFirst) {
+            nodeStack[stackSize] = firstNodeIndex;
+            nearStack[stackSize] = firstNear;
+            stackSize++;
+        }
+
+        if (hitSecond) {
+            nodeStack[stackSize] = secondNodeIndex;
+            nearStack[stackSize] = secondNear;
+            stackSize++;
+        }
+    }
+
+    return closestObject;
+}
+
+Hit getClosestObject(vec3 ro, vec3 rd) {
+    Hit closestObject;
+    closestObject.sdf.d = MAX_DIST;
+    closestObject.materialId = 0u;
+    closestObject.objectId = 0u;
+
+    closestObject = Min(closestObject, traverseBVH(ro, rd, closestObject));
+
+    return closestObject;
+};
+
+void setupLensCamera(vec2 uv, inout vec3 ro, inout vec3 rd) {
+     // simulate a virtual lens
+    vec2 lens = randomInDisk() * cameraApertureRadius;
+    vec3 localOffset = vec3(lens, 0.0);
+   
+    float aspect = float(resolution.x) / float(resolution.y);
+    float sensorHeight = CAMERA_SENSOR_WIDTH_MM / aspect;
+    vec3 pinholeRd = normalize(vec3(uv * sensorHeight, cameraFocalLength));
+
+    float focusT = cameraFocusDistance / max(pinholeRd.z, 0.0001);
+    vec3 focusPoint = pinholeRd * focusT;
+
+    vec3 localRd = normalize(focusPoint - localOffset);
+
+    // rotate from camera space into world space
+    localOffset.yz *= rot2d(-cameraRot.x);
+    localOffset.xz *= rot2d(-cameraRot.y);
+
+    localRd.yz *= rot2d(-cameraRot.x);
+    localRd.xz *= rot2d(-cameraRot.y);
+
+    // camera set up
+    ro = cameraPos + localOffset;
+    rd = localRd;
+}
+
+void traceLensPass(uint materialId, vec3 outwardNormal, inout vec3 rd, inout vec3 currentAbsorption, inout float currentMediumIor) {
+    Material material = materials[materialId];
+    vec3 absorptionColour = max(material.absorption.rgb, vec3(0.0)) * max(material.absorption.a, 0.0);
+    float materialIor = max(material.ior, 1.0001);
+
+    // figguring out if ray is inside of an object
+    // because normals always go outward
+    bool entering = dot(rd, outwardNormal) < 0.0;
+
+    // refract() expects a normal facing against the incoming ray
+    vec3 normal = entering ? outwardNormal : -outwardNormal;
+
+    float incidentIor = currentMediumIor;
+    float transmittedIor = entering ? materialIor : airIor;
+
+    float eta = incidentIor / transmittedIor;
+    float cosTheta = clamp(dot(-rd, normal), 0.0, 1.0);
+    float sinThetaSquared = max(0.0, 1.0 - cosTheta * cosTheta);
+
+    bool totalInternalReflection = eta * eta * sinThetaSquared > 1.0;
+
+    // fresnel reflectance at normal incidence
+    float f0 = (incidentIor - transmittedIor) / (incidentIor + transmittedIor);
+    f0 *= f0;
+
+    // angle-dependent Fresnel reflectance
+    float reflectProbability = fresnelSchlick(cosTheta, f0);
+
+    if (totalInternalReflection || hashFloat() < reflectProbability)  {
+        // reflection stays in the current medium
+        rd = normalize(reflect(rd, normal));
+    } 
+    else {
+        // GLSL refract() implements Snell's law
+        rd = normalize(refract(rd, normal, eta));
+
+        // The ray has crossed into the other medium
+        currentMediumIor = transmittedIor;
+
+        if (entering)
+            currentAbsorption = max(absorptionColour, vec3(0.0));
+        else 
+            currentAbsorption = airAbsorptionColour;
+    }
+}
+
+bool estimateReflectance(uint materialId, vec3 normal, inout vec3 rd, inout vec3 throughput) {
+    // extract material data
+    Material material = materials[materialId];
+    vec3 baseColour = max(material.baseColour.rgb, vec3(0.0));
+    float roughness = clamp(material.roughness, 0.0, 1.0);
+    float metallic = clamp(material.metallic, 0.0, 1.0);
+    float ior = max(material.ior, 1.0001);
+
+    vec3 viewDirection = -rd;
+    float nDotV = max(dot(normal, viewDirection), 0.0001);
+
+    // Fresenel Equation - (n1 - n2) / (n1 + n2)
+    // n1 is air in this case
+    // how much light reflects when crossing boundary between 2 materials
+    // air and an object in most cases, hence using 
+    float dielectricF0Scalar = (ior - 1.0) / (ior + 1.0);
+    dielectricF0Scalar *= dielectricF0Scalar;
+
+    // non-metals have neutral F0 reflectance determined by IOR
+    // metals use baseColour as an approximation of coloured F0
+    vec3 f0 = mix(vec3(dielectricF0Scalar), baseColour, metallic);
+    vec3 fresnel = fresnelSchlick(nDotV, f0);
+
+    // the brighter the colour, the higher cahnce of reflection
+    // lumimance tells us how bright percieved light is
+    float specularProbability = clamp(luminance(fresnel), 0.05, 0.95);
+
+    if (hashFloat() < specularProbability) {
+        // random microfacer normal on the surface based on the roughenss
+        vec3 halfVector = sampleGGXHalfVector(normal, roughness);
+        // reflect the incoming ray in the microfacer normal
+        vec3 nextDirection = reflect(rd, halfVector); 
+
+        // how far the reflected ray is from the normal of the surface
+        float nDotL = dot(normal, nextDirection);
+        // how far the microfacet tilts from the main normal
+        float nDotH = max(dot(normal, halfVector), 0.0001);
+        // incoming angle relative to the microfacet
+        float vDotH = max(dot(viewDirection, halfVector), 0.0001);
+
+        // if reflected ray goes under the surface the path is invalid
+        if (nDotL <= 0.0)
+            return false;
+    
+        // calculate the amount of light obscured by some microfaceletes
+        float alpha = max(roughness * roughness, 0.001);
+        float geometry = smithG1(nDotV, alpha) * smithG1(max(nDotL, 0.0001), alpha);
+
+        fresnel = fresnelSchlick(vDotH, f0);
+        // Cook–Torrance GGX weight
+        throughput *= fresnel * geometry * vDotH / max(nDotV * nDotH * specularProbability, 0.0001);
+
+        rd = nextDirection;
+    }
+    else {
+        // bias more rays towards the center of the hemisphere 
+        // since those provide more contribution
+        rd = cosineWeightedHemisphere(normal);
+
+        vec3 diffuseWeight = (vec3(1.0) - fresnel) * (1.0 - metallic) * baseColour;
+        throughput *= diffuseWeight / max(1.0 - specularProbability, 0.0001);
+    }
+
+    return true;
+}
+
+vec3 rayTrace(vec2 uv) {
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+
+    // camera set up
+    vec3 ro, rd;
+    setupLensCamera(uv, ro, rd);
+    
+    float currentMediumIor = airIor; // air
+    vec3 currentAbsorption = airAbsorptionColour;
+
+    // ray trace
+    for (int i = 0; i < maxReflections; ++i) {
+        Hit hit = getClosestObject(ro, rd);
+
+        if (hit.sdf.d == MAX_DIST) {
+            radiance += throughput * applySkyBox(rd);
+            break;
+        }
+
+        // save hit position for later
+        vec3 hitPosition = ro + rd * hit.sdf.d;
+
+        // Beer–Lambert absorption through the current medium
+        throughput *= exp(-currentAbsorption * hit.sdf.d);
+
+        // check if material exists
+        if (hit.materialId >= materials.length())
+            return vec3(1.0, 0.0, 1.0); // bright magenta makes missing materials obvious
+
+        vec3 emittedLight = max(materials[hit.materialId].emission.rgb, vec3(0.0)) * max(materials[hit.materialId].emission.a, 0.0);
+
+        // emission contributes light without replacing reflected light
+        radiance += throughput * emittedLight;
+
+        if (i == maxReflections - 1)
+            break;
+
+        vec3 normal = hit.sdf.n;
+        // if transparent
+        if (materials[hit.materialId].isTransparent) {
+            traceLensPass(
+                hit.materialId,
+                normal,
+                rd,
+                currentAbsorption,
+                currentMediumIor
+            );
+
+            // move onto the correct side of the boundary
+            ro = hitPosition + rd * 0.001;
+
+            continue;
+        }
+
+        if (!estimateReflectance(hit.materialId, normal, rd, throughput))
+            break;
+
+        // move to the hit point and keep the next ray above the surface
+        ro = hitPosition + normal * 0.001;
+
+        // russian roulette
+        if (russianRoulette && i >= 3) {
+            float survivalProbability = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
+            if (hashFloat() > survivalProbability)
+                break;
+
+            throughput /= survivalProbability;
+        }
+
+    }
+
+    return radiance;
+}
+
+vec3 getCol(vec2 uv) {
+    vec3 col = vec3(0.0);
+
+    for (int i = 0; i < samplesPerPixel; ++i) 
+        col += rayTrace(uv);
+    
+    return col /= samplesPerPixel;
+}
+
+void main() {   
+    // calculate the pixel cordinate in range -1.0 <-> 1.0
+    ivec2 pixel_cords = ivec2(gl_GlobalInvocationID.xy);
+
+    // avoid unecessary invocations 
+    if (any(greaterThanEqual(pixel_cords, resolution)))
+        return;
+
+    // initialise random seed
+    rSeed = uint(pixel_cords.x) * 1973u ^ uint(pixel_cords.y) * 9277u ^ uint(totalFrameCount * 512);
+    pcg_hash();
+
+    // calculate uv, add random vec2() for anti aliasing
+    vec2 uv = (vec2(pixel_cords.xy + vec2(hashFloat()-0.5, hashFloat()-0.5)) - 0.5 * resolution) / resolution.y;
+
+    vec3 col = getCol(uv);
+    imageStore(destTex, pixel_cords, vec4(col, 1.0));
+}

@@ -1,0 +1,29 @@
+# visual studio
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+
+# build output
+out/
+build/
+x64/
+Debug/
+Release/
+CMakeFiles/
+CMakeCache.txt
+
+# compiled files
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.obj
+*.o
+*.lib
+*.exp
+
+# temporary files
+*.tmp
+*.log
