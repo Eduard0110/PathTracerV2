@@ -27,3 +27,6 @@ CMakeCache.txt
 # temporary files
 *.tmp
 *.log
+
+# keep wavefront 3D models
+!resources/3D_models/**/*.obj
