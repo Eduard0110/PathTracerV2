@@ -30,3 +30,4 @@ CMakeCache.txt
 
 # keep wavefront 3D models
 !resources/3D_models/**/*.obj
+!libs/**/*.lib
